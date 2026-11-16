@@ -1,0 +1,70 @@
+rules_version = '2';
+// 时间表网站的 Firestore 规则
+// 1. 每个人只能读写自己的数据（users/{uid}）
+// 2. 前 100 人直接注册；第 101 人起需要一个没用过的邀请码
+// 3. 只有管理员（members/{uid} 里 admin: true，在 Firebase 后台手动设置）能生成和查看邀请码
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function memberPath(uid) { return /databases/$(database)/documents/members/$(uid); }
+    function isMember(uid) { return exists(memberPath(uid)); }
+    function isAdmin() {
+      return signedIn() && isMember(request.auth.uid)
+        && get(memberPath(request.auth.uid)).data.get('admin', false) == true;
+    }
+    // 这次写入是不是"新成员加入"：之前不是成员，写完之后是
+    function joiningNow() {
+      return !isMember(request.auth.uid) && existsAfter(memberPath(request.auth.uid));
+    }
+    function countBefore() {
+      return exists(/databases/$(database)/documents/app/registry)
+        ? get(/databases/$(database)/documents/app/registry).data.count : 0;
+    }
+    function countAfter() {
+      return getAfter(/databases/$(database)/documents/app/registry).data.count;
+    }
+
+    // 每个人自己的课表、打勾、待办、心情
+    match /users/{uid}/{document=**} {
+      allow read: if signedIn() && request.auth.uid == uid;
+      allow write: if signedIn() && request.auth.uid == uid && isMember(uid);
+    }
+
+    // 注册人数（只有一个数字）
+    match /app/registry {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.keys().hasOnly(['count'])
+        && request.resource.data.count == 1 && joiningNow();
+      allow update: if signedIn() && request.resource.data.keys().hasOnly(['count'])
+        && request.resource.data.count == resource.data.count + 1 && joiningNow();
+    }
+
+    // 成员名单：第几个注册、用了哪个邀请码
+    match /members/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['n', 'at', 'code'])
+        && request.resource.data.at == request.time
+        && countAfter() == countBefore() + 1
+        && request.resource.data.n == countAfter()
+        && (
+          request.resource.data.n <= 100
+          || (request.resource.data.code is string
+              && exists(/databases/$(database)/documents/invites/$(request.resource.data.code))
+              && !existsAfter(/databases/$(database)/documents/invites/$(request.resource.data.code)))
+        );
+      allow delete: if signedIn() && request.auth.uid == uid;
+    }
+
+    // 邀请码：管理员生成；用掉的时候会被删掉，所以每个只能用一次
+    match /invites/{code} {
+      allow get, list: if isAdmin();
+      allow create: if isAdmin() && request.resource.data.keys().hasOnly(['at'])
+        && request.resource.data.at == request.time;
+      allow delete: if isAdmin()
+        || (signedIn() && joiningNow()
+            && getAfter(memberPath(request.auth.uid)).data.get('code', '') == code);
+    }
+  }
+}
